@@ -70,3 +70,5 @@ real-data predictive model.
   added per-player game-log and per-team stats calls. Not on the hot
   per-poll path — it's all cached for 12 hours, so it only costs time on
   the periodic background refresh, not on every dashboard load.
+
+_Last verified: push-from-Aki test, 2026-11-26._
