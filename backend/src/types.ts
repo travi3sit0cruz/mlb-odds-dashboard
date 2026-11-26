@@ -418,8 +418,20 @@ export interface NflTeam {
  * Column semantics are position-dependent (a QB's main number is pass
  * yards, a WR's is receiving yards), so each row carries its own labels
  * rather than forcing every position into the same fixed stat columns.
- *   proj*  = season total / games played (transparent, not proprietary)
- *   prob*  = Poisson P(X >= ceil(proj)), same methodology as MLB/WNBA props
+ *   proj*  = matchup-adjusted projection (season average x real opponent
+ *            defense-strength x real pace -- see espnNflTeamStats.ts;
+ *            unadjusted season average if tonight's matchup factors
+ *            aren't available yet). Yds and TD share one real defense
+ *            factor (points-allowed-based, since ESPN exposes no real
+ *            split yards/TD-allowed data); RecOrAtt (completions/
+ *            attempts/receptions) gets pace only, no defense component.
+ *   prob*  = Negative Binomial P(X >= ceil(proj)) using this player's own
+ *            real game-log variance (see espnNflGameLog.ts); falls back to
+ *            Poisson when variance is unknown or not overdispersed.
+ *   var*   = real sample variance (rescaled to tonight's adjusted mean,
+ *            preserving the player's own variance/mean ratio). 0 means
+ *            unknown/insufficient game-log data -- signals the Poisson
+ *            fallback above, not an invented number.
  */
 export interface NflPlayerProjection {
   id: string;
@@ -436,6 +448,9 @@ export interface NflPlayerProjection {
   probYds: number;
   probTD: number;
   probRecOrAtt: number;
+  varYds: number;
+  varTD: number;
+  varRecOrAtt: number;
   /** "Pass Yds" | "Rush Yds" | "Rec Yds" */
   ydsLabel: string;
   /** "Pass TD" | "TD" */

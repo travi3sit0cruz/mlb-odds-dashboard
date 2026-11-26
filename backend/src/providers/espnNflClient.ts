@@ -18,7 +18,8 @@
  */
 
 import type { NflPlayerProjection } from "../types.js";
-import { poissonAtLeast } from "../lib/probability.js";
+import { negBinomAtLeast, sampleVariance } from "../lib/probability.js";
+import { fetchAthleteGameLog, type PlayerGameLog } from "./espnNflGameLog.js";
 
 const SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const CORE_BASE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
@@ -144,8 +145,28 @@ function round1(n: number): number {
   return Math.round(n * 10) / 10;
 }
 
+// Real per-game arrays for whichever stat kind applies to this position --
+// mirrors the season-total selection logic above (isQb/isReceiver), but for
+// the per-game log instead of the season sum. TD, for non-QBs, combines
+// rushing + receiving TDs per game (element-wise), same as the season total
+// does -- a RB/WR/TE can score either way, so a single-game TD count has to
+// add both, not pick one.
+function gameLogValues(
+  gameLog: PlayerGameLog | null, position: string, kind: "yds" | "td" | "recOrAtt",
+): number[] {
+  if (!gameLog) return [];
+  const isQb = position === "QB";
+  const isReceiver = position === "WR" || position === "TE";
+  if (kind === "yds") return isQb ? gameLog.passYds : isReceiver ? gameLog.recYds : gameLog.rushYds;
+  if (kind === "recOrAtt") return isQb ? gameLog.completions : isReceiver ? gameLog.receptions : gameLog.rushAtt;
+  // kind === "td"
+  if (isQb) return gameLog.passTD;
+  const n = Math.min(gameLog.rushTD.length, gameLog.recTD.length);
+  return Array.from({ length: n }, (_, i) => (gameLog.rushTD[i] ?? 0) + (gameLog.recTD[i] ?? 0));
+}
+
 function toProjection(
-  id: string, name: string, team: string, position: string, stats: AthleteSeasonStats,
+  id: string, name: string, team: string, position: string, stats: AthleteSeasonStats, gameLog: PlayerGameLog | null,
 ): NflPlayerProjection {
   const g = stats.gamesPlayed;
   const isQb = position === "QB";
@@ -163,6 +184,13 @@ function toProjection(
   const projTD = round1(seasonTD / g);
   const projRecOrAtt = round1(seasonRecOrAtt / g);
 
+  // Real game-to-game variance from this player's actual log, when
+  // available. 0 signals "unknown", which negBinomAtLeast() treats as
+  // "fall back to a plain Poisson assumption" for that stat.
+  const varYds = sampleVariance(gameLogValues(gameLog, position, "yds"));
+  const varTD = sampleVariance(gameLogValues(gameLog, position, "td"));
+  const varRecOrAtt = sampleVariance(gameLogValues(gameLog, position, "recOrAtt"));
+
   return {
     id: `${team}-${id}`,
     name,
@@ -171,9 +199,14 @@ function toProjection(
     seasonG: g,
     seasonYds, seasonTD, seasonRecOrAtt,
     projYds, projTD, projRecOrAtt,
-    probYds: poissonAtLeast(projYds, Math.ceil(projYds)),
-    probTD: poissonAtLeast(projTD, Math.ceil(projTD)),
-    probRecOrAtt: poissonAtLeast(projRecOrAtt, Math.ceil(projRecOrAtt)),
+    // Baseline (no opponent/pace adjustment yet -- that's applied later, per
+    // actual matchup, by espnNflProvider.ts). Still an upgrade over flat
+    // Poisson on its own: uses this player's real observed variance rather
+    // than assuming textbook Poisson smoothness.
+    probYds: negBinomAtLeast(projYds, varYds || projYds, Math.ceil(projYds)),
+    probTD: negBinomAtLeast(projTD, varTD || projTD, Math.ceil(projTD)),
+    probRecOrAtt: negBinomAtLeast(projRecOrAtt, varRecOrAtt || projRecOrAtt, Math.ceil(projRecOrAtt)),
+    varYds, varTD, varRecOrAtt,
     ydsLabel, tdLabel, thirdLabel,
     // Filled in per-game by espnNflProvider.ts for Live games only; 0 here
     // since this is the season-roster snapshot, not tonight's specific game.
@@ -186,9 +219,12 @@ async function buildTeamSkillRoster(espnTeamId: number, teamAbbr: string, season
   const roster: NflPlayerProjection[] = [];
   for (const athlete of athletes) {
     try {
-      const stats = await fetchAthleteSeasonStats(athlete.id, season);
+      const [stats, gameLog] = await Promise.all([
+        fetchAthleteSeasonStats(athlete.id, season),
+        fetchAthleteGameLog(athlete.id, season),
+      ]);
       if (!stats) continue; // hasn't played this season — nothing real to project
-      roster.push(toProjection(athlete.id, athlete.name, teamAbbr, athlete.position, stats));
+      roster.push(toProjection(athlete.id, athlete.name, teamAbbr, athlete.position, stats, gameLog));
     } catch (err) {
       console.warn(`[espn-nfl] athlete ${athlete.id} (team ${teamAbbr}) fetch failed:`, err);
     }

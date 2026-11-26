@@ -17,7 +17,10 @@
 
 import type { GameStatus, NflGameRecord, NflPlayerProjection, NflTeam } from "../types.js";
 import { getNflRosters } from "./espnNflRosterCache.js";
+import { getNflTeamStats } from "./espnNflTeamStatsCache.js";
+import { computeMatchupFactors, type MatchupFactors, type NflTeamDefensePace } from "./espnNflTeamStats.js";
 import { fetchNflLiveStats, type NflLiveActual } from "./espnNflLiveStats.js";
+import { negBinomAtLeast } from "../lib/probability.js";
 
 const SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard";
 const UA = "Mozilla/5.0 (compatible; mlb-odds-dashboard/1.0)";
@@ -98,6 +101,44 @@ async function withLiveActuals(
   }
 }
 
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
+}
+
+/** Re-projects one roster for tonight's REAL matchup, using the factors
+ *  computed by computeMatchupFactors() in espnNflTeamStats.ts. Yds and TD
+ *  both move with the same real defense-based factor (see that file's doc
+ *  for why there's no play-type-specific split); RecOrAtt moves with pace
+ *  only. Probability is recomputed from the SAME player's own
+ *  variance/mean ratio via negBinomAtLeast, same convention as NBA's
+ *  applyMatchupFactors() in espnNbaScoreboardProvider.ts. Leaves a roster
+ *  completely unchanged if factors is null (team stats not available yet
+ *  this cycle). */
+function applyMatchupFactors(roster: NflPlayerProjection[], factors: MatchupFactors): NflPlayerProjection[] {
+  const rescale = (proj: number, variance: number, factor: number): { proj: number; variance: number; prob: number } => {
+    const adjProj = round1(proj * factor);
+    // variance === 0 means "no real game-log variance known yet" (see
+    // espnNflGameLog.ts) -- preserve that "unknown" signal rather than
+    // inventing a number, and let negBinomAtLeast fall back to Poisson.
+    const dispersionRatio = variance > 0 && proj > 0 ? variance / proj : 1;
+    const adjVariance = variance > 0 ? dispersionRatio * adjProj : 0;
+    const prob = negBinomAtLeast(adjProj, adjVariance || adjProj, Math.ceil(adjProj));
+    return { proj: adjProj, variance: adjVariance, prob };
+  };
+
+  return roster.map((p) => {
+    const yds = rescale(p.projYds, p.varYds, factors.ydsTdFactor);
+    const td = rescale(p.projTD, p.varTD, factors.ydsTdFactor);
+    const recOrAtt = rescale(p.projRecOrAtt, p.varRecOrAtt, factors.paceFactor);
+    return {
+      ...p,
+      projYds: yds.proj, probYds: yds.prob, varYds: yds.variance,
+      projTD: td.proj, probTD: td.prob, varTD: td.variance,
+      projRecOrAtt: recOrAtt.proj, probRecOrAtt: recOrAtt.prob, varRecOrAtt: recOrAtt.variance,
+    };
+  });
+}
+
 /** Fetch the real NFL slate. `date`, if given, selects that calendar day
  *  (ESPN scoreboard is otherwise "current week" by default). */
 export async function fetchNflGames(date?: Date): Promise<NflGameRecord[]> {
@@ -111,7 +152,9 @@ export async function fetchNflGames(date?: Date): Promise<NflGameRecord[]> {
   // Real skill-position rosters, keyed by team abbreviation (same ESPN
   // source as the scoreboard above, so abbreviations line up). Served from
   // a 12h stale-while-revalidate cache -- see espnNflRosterCache.ts.
-  const rosters = await getNflRosters();
+  // teamStats is the real per-team defense/pace data used to adjust each
+  // roster for tonight's ACTUAL opponent -- see espnNflTeamStats.ts.
+  const [rosters, teamStats] = await Promise.all([getNflRosters(), getNflTeamStats()]);
 
   const now = new Date().toISOString();
   const games: NflGameRecord[] = [];
@@ -132,6 +175,15 @@ export async function fetchNflGames(date?: Date): Promise<NflGameRecord[]> {
 
     let homeRoster = rosters.get(homeTeam.abbr) ?? [];
     let awayRoster = rosters.get(awayTeam.abbr) ?? [];
+    // Real matchup-adjustment for tonight's ACTUAL opponent (see
+    // espnNflTeamStats.ts) -- null means team stats aren't available this
+    // cycle yet, in which case both rosters just keep their unadjusted
+    // season-average projections (same as before this feature existed).
+    const factors = computeMatchupFactors(homeTeam.abbr, awayTeam.abbr, teamStats);
+    if (factors) {
+      homeRoster = applyMatchupFactors(homeRoster, factors.home);
+      awayRoster = applyMatchupFactors(awayRoster, factors.away);
+    }
     if (status === "Live" || status === "Final") {
       const merged = await withLiveActuals(event.id, home.team.id, away.team.id, homeRoster, awayRoster);
       homeRoster = merged.home;
