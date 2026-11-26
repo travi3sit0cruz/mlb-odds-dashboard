@@ -1,0 +1,11 @@
+{
+  "name": "mlb-odds-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "cd backend && bun install && cd ../frontend && bun install",
+    "build": "cd frontend && bun run build",
+    "start": "bun run build && cd backend && bun run start",
+    "dev": "echo 'Run these in two terminals:\\n  cd backend && bun run dev\\n  cd frontend && bun run dev'"
+  }
+}

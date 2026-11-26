@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local backups (manual revert snapshots, not meant for version control)
+.backups/
+
+# Env / secrets
+.env
+.env.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
